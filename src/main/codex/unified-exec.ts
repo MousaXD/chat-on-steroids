@@ -253,6 +253,7 @@ const WATCH_EXIT_QUIET_MS = 150;
 const WATCH_EXIT_QUIET_CAP_MS = 1_000;
 export const MAX_COMPLETED_EXEC_RESULTS = 64;
 export const COMPLETED_EXEC_OUTPUT_BYTES = 256 * 1024;
+export const COMPLETED_EXEC_RETENTION_MS = 15 * 60_000;
 
 /** Applies `UNIFIED_EXEC_ENV` over the caller's environment, as `apply_unified_exec_env`. */
 export function applyUnifiedExecEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -286,8 +287,23 @@ class UnifiedExecProcess {
   private readonly startedAt = Date.now();
   private resolveCompletion!: (value: ProcessCompletion) => void;
   readonly completion = new Promise<ProcessCompletion>(resolve => { this.resolveCompletion = resolve; });
+  readonly outputSettled = this.completion.then(async () => {
+    if (!this.outputClosed) {
+      const closed = this.outputClosedNotify.notified();
+      try { this.outputTimedOut = await raceWithTimeout([closed], POST_EXIT_CLOSE_WAIT_CAP_MS); }
+      finally { closed.dispose(); }
+      this.closeOutput();
+    }
+    // Descendants can inherit pipes and outlive the leader. Stop recording after the
+    // drain window while leaving their pipes flowing; never signal them from cleanup.
+    this.detachPipeCapture?.();
+    this.detachPipeCapture = undefined;
+  });
   private buffer = new HeadTailBuffer();
-  private readonly history = new HeadTailBuffer(COMPLETED_EXEC_OUTPUT_BYTES);
+  private history = new HeadTailBuffer(COMPLETED_EXEC_OUTPUT_BYTES);
+  private recording = true;
+  private outputTimedOut = false;
+  private detachPipeCapture?: () => void;
   private displayBuffer: HeadTailBuffer | undefined;
   private readonly batchDisplay: CommandBatchDisplay | undefined;
   readonly outputNotify = new Notify();
@@ -299,6 +315,7 @@ class UnifiedExecProcess {
   private exited = false;
   private exit: number | null = null;
   private failure: string | null = null;
+  private classifiedExit?: boolean;
   private openStreams = 0;
   private child: ChildProcess | null = null;
   private pty: PtyProcess | null = null;
@@ -398,27 +415,24 @@ class UnifiedExecProcess {
     managed.child = child;
     // stdout and stderr are combined into one stream, exactly as `combine_output_receivers`
     // does on the local Codex path, so interleaving is preserved in arrival order.
+    let capture: UnifiedExecProcess | null = managed;
+    managed.detachPipeCapture = () => { capture = null; };
     for (const stream of [child.stdout, child.stderr]) {
       if (!stream) continue;
       managed.openStreams += 1;
-      stream.on('data', (chunk: Buffer) => managed.pushChunk(chunk));
-      stream.on('end', () => managed.streamEnded());
-      stream.on('error', () => managed.streamEnded());
+      stream.on('data', (chunk: Buffer) => capture?.pushChunk(chunk));
+      stream.on('close', () => capture?.streamEnded());
+      stream.on('error', () => {});
     }
     if (managed.openStreams === 0) managed.closeOutput();
 
-    const spawnFailure = new Promise<void>((resolve) => {
-      child.once('error', (error: Error) => {
-        managed.failure = error.message;
-        managed.signalExit(null);
-        managed.closeOutput();
-        resolve();
-      });
+    child.once('error', (error: Error) => {
+      if (!capture) return;
+      capture.failure = error.message;
+      capture.signalExit(null);
+      capture.closeOutput();
     });
-    void spawnFailure;
-    child.once('exit', (code, signal) => {
-      managed.signalExit(code === null && signal ? null : code);
-    });
+    child.once('exit', (code) => capture?.signalExit(code));
 
     await managed.waitForEarlyExit();
     // Node reports an OS-level spawn failure (for example ENOENT for a missing
@@ -453,6 +467,7 @@ class UnifiedExecProcess {
   private pushChunk(chunk: Buffer): void {
     if (chunk.length === 0) return;
     for (const watcher of this.watchers) { try { watcher(chunk); } catch { /* a viewer never breaks the command */ } }
+    if (!this.recording) return;
     this.history.pushChunk(chunk);
     this.buffer.pushChunk(chunk);
     if (this.batchDisplay) this.displayBuffer!.pushChunk(this.batchDisplay.push(chunk));
@@ -493,10 +508,9 @@ class UnifiedExecProcess {
     return drained;
   }
 
-  /** Completed output is immutable once both exit and stream closure are observed. */
-  completedOutput(): Buffer | null {
-    return this.hasExited() && this.outputClosed
-      ? (this.displayBuffer ?? this.buffer).toBytesWithOmissionMarker() : null;
+  discardCapturedOutput(): void {
+    this.recording = false;
+    this.history = new HeadTailBuffer(COMPLETED_EXEC_OUTPUT_BYTES);
   }
 
   /** Independent of the unread cursor: explicit rereads include earlier delivered chunks. */
@@ -506,7 +520,8 @@ class UnifiedExecProcess {
 
   benignExit(classify: ExecCommandRequest['classifyExit']): boolean {
     // An omitted diagnostic or still-open stream cannot prove a non-zero result benign.
-    return this.hasExited() && this.outputClosed && this.history.omittedBytes() === 0 &&
+    if (!this.hasExited() || !this.outputClosed) return false;
+    return this.classifiedExit ??= !this.outputTimedOut && this.history.omittedBytes() === 0 &&
       (classify?.(this.exitCode(), this.retainedOutput().toString('utf8')) ?? false);
   }
 
@@ -603,6 +618,8 @@ export interface ExecCommandToolOutput {
   benignExit?: boolean;
   /** Exact process lifetime for recording; never serialized into the MCP response. */
   completion?: Promise<ProcessCompletion>;
+  /** Exact lifetime for registering ownership after the initial response has been collected. */
+  identity?: object;
   chunkId: string;
   wallTimeMs: number;
   rawOutput: Buffer;
@@ -725,8 +742,7 @@ interface ProcessEntry {
   tty: boolean;
   startedAt: number;
   initialExecCommandActive: boolean;
-  /** Cursor into this process's own completed buffer; offers never consume bytes. */
-  delivery?: { offset: number; offer?: { end: number; publication: OutputPublication } };
+  termination?: Promise<void>;
 }
 
 /** Local response completion, not a claim that a remote model understood the output. */
@@ -750,9 +766,43 @@ export interface BackgroundExecState {
   exitedUnread: Array<{ processId: number; exitCode: number | null }>;
 }
 
+type OutputSnapshot = Pick<ExecCommandToolOutput, 'rawOutput' | 'displayOutput' | 'originalTokenCount' | 'outputOmittedBytes'>;
+
+interface CompletedResult {
+  identity: object;
+  expiresAt: number;
+  command: string;
+  exitCode: number | null;
+  benignExit: boolean;
+  replay: Pick<OutputSnapshot, 'rawOutput' | 'displayOutput'>;
+  unread?: OutputSnapshot & {
+    offset: number;
+    offer?: { end: number; publication: OutputPublication };
+  };
+}
+
+function snapshotOutput(collected: ReturnType<UnifiedExecProcess['takeBuffer']>): OutputSnapshot {
+  const visible = collected.display ?? collected.raw;
+  return {
+    rawOutput: collected.raw.toBytesWithOmissionMarker(),
+    ...(collected.display ? { displayOutput: collected.display.toBytesWithOmissionMarker() } : {}),
+    originalTokenCount: approxTokensFromByteCount(visible.totalBytes()),
+    outputOmittedBytes: visible.omittedBytes() || null
+  };
+}
+
+function boundCompletedBuffer(buffer: HeadTailBuffer): HeadTailBuffer {
+  const bounded = new HeadTailBuffer(COMPLETED_EXEC_OUTPUT_BYTES);
+  bounded.pushBuffer(buffer);
+  return bounded;
+}
+
 export class UnifiedExecProcessManager {
   private readonly processes = new Map<number, ProcessEntry>();
-  private readonly completed = new Map<number, Pick<ExecCommandToolOutput, 'rawOutput' | 'displayOutput' | 'exitCode' | 'benignExit'> & { identity: object }>();
+  private readonly completed = new Map<number, CompletedResult>();
+  private completedExpiry?: NodeJS.Timeout;
+  private readonly pendingSpawns = new Map<number, Promise<UnifiedExecProcess>>();
+  private shutdown?: Promise<void>;
   private releaseListener?: (processId: number) => void;
   private processChangeListener?: () => void;
   private readonly reservedProcessIds = new Set<number>();
@@ -778,8 +828,8 @@ export class UnifiedExecProcessManager {
   }
 
   /**
-   * `rand::rng().random_range(1_000..100_000)`, retried against the reservations. A process id is
-   * what later calls name to write to or read a running command, so it is not guessable either.
+   * Reserve a numeric id just before launch. The id names a session and grants no authority. A
+   * retained result keeps its id reserved independently of active process capacity.
    */
   allocateProcessId(draw: () => number = () => randomInt(1_000, 100_000)): number {
     for (;;) {
@@ -791,43 +841,94 @@ export class UnifiedExecProcessManager {
   }
 
   releaseProcessId(processId: number): void {
-    this.reservedProcessIds.delete(processId);
+    const reserved = this.reservedProcessIds.delete(processId);
     this.processes.delete(processId);
-    this.completed.delete(processId);
+    const retained = this.completed.delete(processId);
+    if (!reserved && !retained) return;
     this.releaseListener?.(processId);
     this.notifyProcessChange();
   }
 
-  private retainCompleted(entry: ProcessEntry): void {
-    const rawOutput = Buffer.from(entry.process.retainedOutput());
-    const exitCode = entry.process.exitCode();
+  processIdentity(processId: number): object | undefined {
+    return this.processes.get(processId)?.process.identity ?? this.completed.get(processId)?.identity;
+  }
+
+  private scheduleCompletedExpiry(): void {
+    if (this.completedExpiry) return;
+    const oldest = this.completed.values().next().value;
+    if (!oldest) return;
+    this.completedExpiry = setTimeout(() => {
+      this.completedExpiry = undefined;
+      const now = performance.now();
+      for (const [id, result] of this.completed) {
+        if (result.expiresAt > now) break;
+        this.releaseProcessId(id);
+      }
+      this.scheduleCompletedExpiry();
+    }, Math.max(1, Math.ceil(oldest.expiresAt - performance.now())));
+    this.completedExpiry.unref();
+  }
+
+  private retainCompleted(entry: ProcessEntry, unread: boolean): void {
+    if (this.processes.get(entry.processId) !== entry) return;
+    const { process } = entry;
+    const rawOutput = process.retainedOutput();
+    const benignExit = process.benignExit(entry.classifyExit);
+    const exitCode = process.exitCode();
+    let pending: OutputSnapshot | undefined;
+    if (unread) {
+      const drained = process.takeBuffer();
+      pending = snapshotOutput({
+        raw: boundCompletedBuffer(drained.raw),
+        display: drained.display && boundCompletedBuffer(drained.display)
+      });
+    }
+    process.discardCapturedOutput();
+
     this.processes.delete(entry.processId);
     this.reservedProcessIds.delete(entry.processId);
     this.completed.set(entry.processId, {
-      identity: entry.process.identity,
-      rawOutput, exitCode,
-      ...(entry.batchMarker ? { displayOutput: new CommandBatchDisplay(entry.batchMarker).push(rawOutput, true) } : {}),
-      benignExit: entry.process.benignExit(entry.classifyExit)
+      identity: process.identity,
+      command: entry.hookCommand,
+      expiresAt: performance.now() + COMPLETED_EXEC_RETENTION_MS,
+      replay: {
+        rawOutput,
+        ...(entry.batchMarker ? { displayOutput: new CommandBatchDisplay(entry.batchMarker).push(rawOutput, true) } : {})
+      },
+      exitCode,
+      benignExit,
+      ...(pending ? { unread: { ...pending, offset: 0 } } : {})
     });
-    this.notifyProcessChange();
     while (this.completed.size > MAX_COMPLETED_EXEC_RESULTS) this.releaseProcessId(this.completed.keys().next().value!);
+    this.scheduleCompletedExpiry();
+    this.notifyProcessChange();
+  }
+
+  /** Move an exited, settled session to the output cache without consuming its unread bytes. */
+  private retireIfIdle(entry: ProcessEntry): void {
+    if (entry.initialExecCommandActive || entry.termination ||
+        !entry.process.hasExited() || !entry.process.outputClosed ||
+        this.processes.get(entry.processId) !== entry) return;
+    const release = entry.process.interactionLock.tryLock();
+    if (!release) return;
+    try { this.retainCompleted(entry, true); } finally { release(); }
   }
 
   async execCommand(request: ExecCommandRequest): Promise<ExecCommandToolOutput> {
+    const { processId } = request;
+    if (!this.reservedProcessIds.has(processId) || this.pendingSpawns.has(processId) || this.processes.has(processId)) {
+      throw UnifiedExecError.createProcess('terminal session reservation was lost before launch');
+    }
+    let spawning: Promise<UnifiedExecProcess> | undefined;
     let process: UnifiedExecProcess;
     try {
-      this.ensureProcessCapacity(request.processId);
-    } catch (error) {
-      this.releaseProcessId(request.processId);
-      throw error;
-    }
-    try {
+      this.ensureProcessCapacity();
       // `UnifiedExecRuntime::run` prefixes every PowerShell script before it reaches the
       // process launcher so pipe-mode output is UTF-8 just like PTY output.
       // The app also ends it with the exit status of its last statement (see withPowershellExitStatus).
       const command =
         request.shellType === 'powershell' ? withPowershellExitStatus(prefixPowershellScriptWithUtf8(request.command)) : request.command;
-      process = await UnifiedExecProcess.spawn({
+      spawning = UnifiedExecProcess.spawn({
         batchMarker: request.batchMarker,
         command,
         shellType: request.shellType,
@@ -835,100 +936,97 @@ export class UnifiedExecProcessManager {
         env: request.env,
         tty: request.tty
       });
+      this.pendingSpawns.set(processId, spawning);
+      process = await spawning;
     } catch (error) {
-      this.releaseProcessId(request.processId);
+      if (!spawning || this.pendingSpawns.get(processId) === spawning) {
+        this.pendingSpawns.delete(processId);
+        this.releaseProcessId(processId);
+      }
       throw error instanceof UnifiedExecError
         ? error
         : UnifiedExecError.createProcess(error instanceof Error ? error.message : String(error));
     }
 
+    if (this.pendingSpawns.get(processId) !== spawning) {
+      throw UnifiedExecError.createProcess('terminal manager shut down during launch');
+    }
+    this.pendingSpawns.delete(processId);
+
     const start = Date.now();
-    const incarnation = this.nextProcessIncarnation++;
     const wallStart = performance.now();
-    // Stored before the yield wait, so interrupting the call cannot drop the session.
-    const processStartedAlive = !process.hasExited() && process.exitCode() === null;
-    if (processStartedAlive) {
-      this.processes.set(request.processId, {
-        process,
-        processId: request.processId,
-        incarnation,
-        cwd: request.displayCwd,
-        hookCommand: request.hookCommand,
-        tty: request.tty,
-        startedAt: start,
-        initialExecCommandActive: true,
-        classifyExit: request.classifyExit, batchMarker: request.batchMarker
-      });
-      void process.completion.then(
-        () => this.notifyProcessChange(),
-        () => this.notifyProcessChange()
-      );
-    }
+    const entry: ProcessEntry = {
+      process,
+      processId,
+      incarnation: this.nextProcessIncarnation++,
+      cwd: request.displayCwd,
+      hookCommand: request.hookCommand,
+      tty: request.tty,
+      startedAt: start,
+      initialExecCommandActive: true,
+      classifyExit: request.classifyExit,
+      batchMarker: request.batchMarker
+    };
+    // Keep custody even when the transport drops the initial call.
+    this.processes.set(processId, entry);
+    void process.outputSettled.then(() => {
+      this.retireIfIdle(entry);
+      // Even a concurrent reader may still own the terminal buffer after exit.
+      if (this.processes.get(processId) === entry) this.notifyProcessChange();
+    });
 
-    const deadline = start + clampYieldTime(request.yieldTimeMs);
-    const collected = await collectOutputUntilDeadline(process, deadline);
-    const wallTimeMs = Math.max(0, performance.now() - wallStart);
-
-    const visible = collected.display ?? collected.raw;
-    const originalTokenCount = approxTokensFromByteCount(visible.totalBytes());
-    const outputOmittedBytes = visible.omittedBytes() === 0 ? null : visible.omittedBytes();
-    const rawOutput = collected.raw.toBytesWithOmissionMarker();
-    const chunkId = generateChunkId();
-
-    const failure = process.failureMessage();
-    if (failure !== null) {
-      this.releaseProcessId(request.processId);
-      throw UnifiedExecError.processFailed(failure);
-    }
-
-    let responseProcessId: number | null;
-    let exitCode: number | null;
-    if (processStartedAlive) {
-      const status = this.refreshProcessState(request.processId);
-      if (status.kind === 'alive') {
-        responseProcessId = status.processId;
-        exitCode = status.exitCode;
-      } else if (status.kind === 'exited') {
-        responseProcessId = null;
-        exitCode = status.exitCode;
-      } else {
-        throw UnifiedExecError.unknownProcessId(request.processId);
+    try {
+      const collected = await collectOutputUntilDeadline(process, start + clampYieldTime(request.yieldTimeMs));
+      if (this.processes.get(processId) !== entry) throw UnifiedExecError.unknownProcessId(processId);
+      const failure = process.failureMessage();
+      if (failure !== null) {
+        this.releaseProcessId(processId);
+        throw UnifiedExecError.processFailed(failure);
       }
-    } else {
-      this.retainCompleted({ process, processId: request.processId, cwd: request.displayCwd,
-        hookCommand: request.hookCommand, tty: request.tty, startedAt: start, incarnation, initialExecCommandActive: false,
-        classifyExit: request.classifyExit, batchMarker: request.batchMarker });
-      responseProcessId = null;
-      exitCode = process.exitCode();
+      return await this.processResponse(entry, collected, request, wallStart, true);
+    } finally {
+      entry.initialExecCommandActive = false;
+      this.retireIfIdle(entry);
     }
+  }
 
-    const response = {
-      ...(responseProcessId === null ? { completedSessionId: request.processId } : {
+  private async processResponse(
+    entry: ProcessEntry,
+    collected: ReturnType<UnifiedExecProcess['takeBuffer']>,
+    request: Pick<ExecCommandRequest, 'truncationPolicy' | 'maxOutputTokens'>,
+    wallStart: number,
+    initial = false
+  ): Promise<ExecCommandToolOutput> {
+    const { process, processId, classifyExit } = entry;
+    const exited = process.hasExited();
+    if (exited) {
+      await process.outputSettled;
+      const final = process.takeBuffer();
+      collected.raw.pushBuffer(final.raw);
+      if (final.display) {
+        collected.display ??= new HeadTailBuffer();
+        collected.display.pushBuffer(final.display);
+      }
+    }
+    const benignExit = process.benignExit(classifyExit);
+    if (exited && (initial || !entry.initialExecCommandActive)) this.retainCompleted(entry, false);
+    return {
+      ...(exited ? { completedSessionId: processId } : initial ? {
         completion: process.completion.then(async completion => {
-          if (!process.outputClosed) {
-            const closed = process.outputClosedNotify.notified();
-            try { await raceWithTimeout([closed], POST_EXIT_CLOSE_WAIT_CAP_MS); } finally { closed.dispose(); }
-          }
-          return { ...completion, benignExit: process.benignExit(request.classifyExit) };
+          await process.outputSettled;
+          return { ...completion, benignExit: process.benignExit(classifyExit) };
         })
-      }),
-      benignExit: process.benignExit(request.classifyExit),
-      chunkId,
-      wallTimeMs,
-      rawOutput,
-      ...(collected.display ? { displayOutput: collected.display.toBytesWithOmissionMarker() } : {}),
+      } : {}),
+      identity: process.identity,
+      benignExit,
+      chunkId: generateChunkId(),
+      wallTimeMs: Math.max(0, performance.now() - wallStart),
+      ...snapshotOutput(collected),
       truncationPolicy: request.truncationPolicy,
       maxOutputTokens: request.maxOutputTokens,
-      processId: responseProcessId,
-      exitCode,
-      originalTokenCount,
-      outputOmittedBytes
+      processId: exited ? null : processId,
+      exitCode: process.exitCode()
     };
-    if (responseProcessId !== null) {
-      const entry = this.processes.get(request.processId);
-      if (entry?.process === process) entry.initialExecCommandActive = false;
-    }
-    return response;
   }
 
   async writeStdin(request: WriteStdinRequest): Promise<ExecCommandToolOutput> {
@@ -937,50 +1035,48 @@ export class UnifiedExecProcessManager {
       if (!saved) return null;
       if (identity && saved.identity !== identity) throw UnifiedExecError.unknownProcessId(request.processId);
       if (request.input !== '') throw UnifiedExecError.processFailed('Process already completed; no input was sent. Use empty chars to read its retained output.');
-      return { ...saved, chunkId: generateChunkId(), wallTimeMs: 0, processId: null,
-        completedSessionId: request.processId, replayed: true, originalTokenCount: approxTokenCount((saved.displayOutput ?? saved.rawOutput).toString('utf8')),
-        outputOmittedBytes: null, truncationPolicy: request.truncationPolicy, maxOutputTokens: request.maxOutputTokens };
+      const { unread } = saved;
+      const { rawOutput, displayOutput } = unread ?? saved.replay;
+      const offset = unread?.offset ?? 0;
+      saved.unread = undefined;
+      return {
+        rawOutput: offset > 0 ? (displayOutput ?? rawOutput).subarray(offset) : rawOutput,
+        ...(displayOutput ? { displayOutput: displayOutput.subarray(offset) } : {}),
+        benignExit: saved.benignExit,
+        exitCode: saved.exitCode,
+        chunkId: generateChunkId(), wallTimeMs: 0, processId: null, completedSessionId: request.processId,
+        ...(unread ? {} : { replayed: true }),
+        originalTokenCount: unread?.originalTokenCount ?? approxTokenCount((displayOutput ?? rawOutput).toString('utf8')),
+        outputOmittedBytes: unread?.outputOmittedBytes ?? null,
+        truncationPolicy: request.truncationPolicy, maxOutputTokens: request.maxOutputTokens
+      };
     };
     const saved = replay();
     if (saved) return saved;
     const entry = this.processes.get(request.processId);
     if (!entry) throw UnifiedExecError.unknownProcessId(request.processId);
-    const locked = entry.process;
+    const { process, tty } = entry;
 
-    // Reads and writes against one session must not overlap: they share a draining buffer.
-    const release = await locked.interactionLock.lock();
+    // Polls share the live draining buffer. If the first poll retires it, later
+    // queued callers may reread that exact result and never a recycled id.
+    const release = await process.interactionLock.lock();
     try {
-      const saved = replay(locked.identity);
+      const saved = replay(process.identity);
       if (saved) return saved;
-      const current = this.processes.get(request.processId);
-      if (!current || current.process !== locked) throw UnifiedExecError.unknownProcessId(request.processId);
-      const { process, tty } = { process: current.process, tty: current.tty };
+      if (this.processes.get(request.processId) !== entry) throw UnifiedExecError.unknownProcessId(request.processId);
 
-      let statusAfterWrite: ProcessStatus | null = null;
       if (request.input !== '') {
         if (process.hasExited()) throw UnifiedExecError.processFailed('Process already completed; no input was sent. Use empty chars to read its retained output.');
         if (!tty) {
-          if (request.input === INTERRUPT) {
-            await process.interrupt();
-          } else {
-            throw UnifiedExecError.stdinClosed();
-          }
+          if (request.input !== INTERRUPT) throw UnifiedExecError.stdinClosed();
+          await process.interrupt();
         } else {
           try {
             await process.write(request.input);
             // A brief window so the child's reaction is more likely to land in the poll below.
             await sleep(100);
           } catch (error) {
-            const status = this.refreshProcessState(request.processId);
-            if (status.kind === 'exited') {
-              statusAfterWrite = status;
-            } else if (error instanceof UnifiedExecError && error.kind === 'process_failed') {
-              await process.terminate();
-              this.releaseProcessId(request.processId);
-              throw error;
-            } else {
-              throw error;
-            }
+            if (!process.hasExited()) throw error;
           }
         }
       }
@@ -997,62 +1093,21 @@ export class UnifiedExecProcessManager {
 
       const start = Date.now();
       const wallStart = performance.now();
-      // Empty calls are polls, not collection windows. Once the process produces anything,
-      // returning it immediately saves the caller another multi-second connector round trip;
-      // bytes that arrive later remain in the draining buffer for the next poll. Non-empty
-      // writes keep Codex's collection-window behavior so one interactive response is gathered.
+      // Empty calls return as soon as live output arrives; non-empty writes keep
+      // the collection window so the response to an interactive input is gathered.
       const collected = await collectOutputUntilDeadline(process, start + yieldTimeMs, request.input === '');
-      const wallTimeMs = Math.max(0, performance.now() - wallStart);
-
-      const visible = collected.display ?? collected.raw;
-      const originalTokenCount = approxTokensFromByteCount(visible.totalBytes());
-      const outputOmittedBytes = visible.omittedBytes() === 0 ? null : visible.omittedBytes();
-      // An explicit poll may replay an offered-but-unacknowledged page, but must not
-      // repeat earlier pages that this caller has already acknowledged automatically.
-      const deliveredOffset = current.delivery?.offset ?? 0;
-      const rawOutput = deliveredOffset > 0
-        ? visible.toBytesWithOmissionMarker().subarray(deliveredOffset)
-        : collected.raw.toBytesWithOmissionMarker();
-      const chunkId = generateChunkId();
-
       const failure = process.failureMessage();
       if (failure !== null) {
-        this.releaseProcessId(request.processId);
+        if (this.processes.get(request.processId) === entry) this.releaseProcessId(request.processId);
         throw UnifiedExecError.processFailed(failure);
       }
-
-      const status = statusAfterWrite ?? this.refreshProcessState(request.processId);
-      let responseProcessId: number | null;
-      let exitCode: number | null;
-      if (status.kind === 'alive') {
-        responseProcessId = status.processId;
-        exitCode = status.exitCode;
-      } else if (status.kind === 'exited') {
-        responseProcessId = null;
-        exitCode = status.exitCode;
-      } else if (process.hasExited()) {
-        responseProcessId = null;
-        exitCode = process.exitCode();
-      } else {
+      if (!process.hasExited() && this.processes.get(request.processId) !== entry) {
         throw UnifiedExecError.unknownProcessId(request.processId);
       }
-
-      return {
-        ...(responseProcessId === null ? { completedSessionId: request.processId } : {}),
-        benignExit: process.benignExit(current.classifyExit),
-        chunkId,
-        wallTimeMs,
-        rawOutput,
-        ...(collected.display ? { displayOutput: deliveredOffset > 0 ? rawOutput : collected.display.toBytesWithOmissionMarker() } : {}),
-        truncationPolicy: request.truncationPolicy,
-        maxOutputTokens: request.maxOutputTokens,
-        processId: responseProcessId,
-        exitCode,
-        originalTokenCount,
-        outputOmittedBytes
-      };
+      return await this.processResponse(entry, collected, request, wallStart);
     } finally {
       release();
+      this.retireIfIdle(entry);
     }
   }
 
@@ -1084,7 +1139,7 @@ export class UnifiedExecProcessManager {
           await new Promise(resolve => setTimeout(resolve, WATCH_EXIT_QUIET_MS - quietFor));
         }
       }
-      if (watching) onExit(completion);
+      try { if (watching) onExit(completion); } finally { stop(); }
     });
     return { history: entry.process.historyBytes(), startedAt: entry.startedAt, unsubscribe: () => { watching = false; stop(); } };
   }
@@ -1108,14 +1163,11 @@ export class UnifiedExecProcessManager {
   backgroundState(processIds: ReadonlySet<number>): BackgroundExecState {
     const running: number[] = [];
     const exitedUnread: Array<{ processId: number; exitCode: number | null }> = [];
-    for (const entry of this.processes.values()) {
-      if (entry.initialExecCommandActive) continue;
-      if (!processIds.has(entry.processId)) continue;
-      if (entry.process.hasExited()) {
-        exitedUnread.push({ processId: entry.processId, exitCode: entry.process.exitCode() });
-      } else {
-        running.push(entry.processId);
-      }
+    for (const id of processIds) {
+      const entry = this.processes.get(id);
+      if (entry && !entry.initialExecCommandActive && !entry.process.hasExited()) running.push(id);
+      const result = this.completed.get(id);
+      if (result?.unread) exitedUnread.push({ processId: id, exitCode: result.exitCode });
     }
     return {
       running: running.sort((left, right) => left - right),
@@ -1123,133 +1175,109 @@ export class UnifiedExecProcessManager {
     };
   }
 
-  /** Exited rows not handled by the starting exec; polling releases these rows. */
+  /** Exited rows whose saved unread output has not been delivered. */
   exitedUnread(processIds: ReadonlySet<number>): Array<{ processId: number; exitCode: number | null }> {
     return this.backgroundState(processIds).exitedUnread;
   }
 
   /** A later owner call acknowledges a successfully published page, even within one request ID. */
   async acknowledgeCompletedOutput(processIds: ReadonlySet<number>, startedAt: number, except?: number): Promise<number[]> {
-    const retired: number[] = [];
+    const delivered: number[] = [];
     for (const id of processIds) {
       if (id === except) continue; // Explicit polling still owns its normal result path.
-      const entry = this.processes.get(id);
-      if (!entry?.delivery?.offer) continue;
-      const release = await entry.process.interactionLock.lock();
-      try {
-        if (this.processes.get(id) !== entry) continue;
-        const offered = entry.delivery?.offer;
-        if (!offered || offered.publication.failed || offered.publication.completedAt === null ||
-            startedAt <= offered.publication.completedAt) continue;
-        const output = entry.process.completedOutput();
-        if (output === null) continue;
-        entry.delivery = { offset: offered.end };
-        if (offered.end >= output.length) {
-          this.retainCompleted(entry);
-          retired.push(id);
-        }
-      } finally { release(); }
+      const result = this.completed.get(id);
+      const unread = result?.unread;
+      const offered = unread?.offer;
+      if (!result || !unread || !offered || offered.publication.failed || offered.publication.completedAt === null ||
+          startedAt <= offered.publication.completedAt) continue;
+      unread.offset = offered.end;
+      unread.offer = undefined;
+      if (offered.end >= (unread.displayOutput ?? unread.rawOutput).length) {
+        result.unread = undefined;
+        delivered.push(id);
+      }
     }
-    return retired;
+    return delivered;
   }
 
-  /**
-   * Offer one bounded page without draining the process. A broken response reoffers the
-   * same bytes; an older concurrent response cannot advance a newer delivery cursor.
-   */
+  /** Offer one bounded page. A failed response leaves its bytes available for the next attempt. */
   async offerCompletedOutput(
     processIds: ReadonlySet<number>, publication: OutputPublication, maxBytes: number
   ): Promise<CompletedOutputPage | null> {
     if (publication.failed || maxBytes < 4) return null;
-    for (const { processId } of this.backgroundState(processIds).exitedUnread) {
-      const entry = this.processes.get(processId);
-      if (!entry) continue;
-      const release = await entry.process.interactionLock.lock();
-      try {
-        if (this.processes.get(processId) !== entry || entry.initialExecCommandActive) continue;
-        const output = entry.process.completedOutput();
-        if (output === null) continue;
-        const delivery = entry.delivery ??= { offset: 0 };
-        // An in-flight or published offer owns this page until failure or later receipt.
-        if (delivery.offer && !delivery.offer.publication.failed) continue;
-        const start = delivery.offset;
-        let end = Math.min(output.length, start + Math.floor(maxBytes));
-        // Do not split a UTF-8 character across separately rendered MCP responses.
-        while (end > start && end < output.length && (output[end]! & 0xc0) === 0x80) end--;
-        if (end === start && output.length > start) continue;
-        delivery.offer = { end, publication };
-        return { processId, command: entry.hookCommand, exitCode: entry.process.exitCode(),
-          output: output.subarray(start, end).toString('utf8'), start, end, total: output.length };
-      } finally { release(); }
+    for (const id of [...processIds].sort((left, right) => left - right)) {
+      const result = this.completed.get(id);
+      const unread = result?.unread;
+      if (!result || !unread || (unread.offer && !unread.offer.publication.failed)) continue;
+      const output = unread.displayOutput ?? unread.rawOutput;
+      const start = unread.offset;
+      let end = Math.min(output.length, start + Math.floor(maxBytes));
+      // Do not split a UTF-8 character across separately rendered MCP responses.
+      while (end > start && end < output.length && (output[end]! & 0xc0) === 0x80) end--;
+      if (end === start && output.length > start) continue;
+      unread.offer = { end, publication };
+      return { processId: id, command: result.command, exitCode: result.exitCode,
+        output: output.subarray(start, end).toString('utf8'), start, end, total: output.length };
     }
     return null;
   }
 
   async terminateProcess(processId: number, expectedIncarnation?: number): Promise<boolean> {
     const entry = this.processes.get(processId);
-    if (!entry) return false;
-    // Renderer actions carry the exact live incarnation they displayed. Refuse a stale row after
-    // natural exit, and refuse ABA reuse of the same numeric id without consuming retained output.
-    if (expectedIncarnation !== undefined &&
-        (entry.incarnation !== expectedIncarnation || entry.process.hasExited())) return false;
-    if (!entry.process.hasExited()) await entry.process.terminate();
-    const current = this.processes.get(processId);
-    if (current && current.process === entry.process) {
-      // Match Codex's InitialExecCommandGuard: the initial exec response still
-      // owns this entry until it has refreshed the process's terminal state.
-      // Removing it here would turn a successful concurrent termination into
-      // an UnknownProcessId error in that original exec_command call.
-      if (current.initialExecCommandActive) return true;
-      this.releaseProcessId(processId);
+    if (!entry || entry.process.hasExited() ||
+        (expectedIncarnation !== undefined && entry.incarnation !== expectedIncarnation)) return false;
+
+    entry.termination ??= entry.process.terminate();
+    try {
+      await entry.termination;
+      // The initial exec still owns its response and will collect the exit.
+      if (this.processes.get(processId) === entry && !entry.initialExecCommandActive) this.releaseProcessId(processId);
+      return true;
+    } finally {
+      entry.termination = undefined;
+      this.retireIfIdle(entry);
     }
-    return true;
   }
 
-  async terminateAllProcesses(): Promise<void> {
+  terminateAllProcesses(): Promise<void> {
+    if (this.shutdown) return this.shutdown;
+    const pending = [...this.pendingSpawns.values()];
     const entries = [...this.processes.values()];
-    for (const id of new Set([...this.reservedProcessIds, ...this.completed.keys()])) this.releaseListener?.(id);
+    const ids = new Set([...this.reservedProcessIds, ...this.completed.keys()]);
+    this.pendingSpawns.clear();
     this.completed.clear();
     this.processes.clear();
     this.reservedProcessIds.clear();
-    // App shutdown is the caller that matters, so this has to behave like `terminateProcess`
-    // does for one id: skip the sessions that are already gone rather than spending a taskkill
-    // on each. Awaiting them one after another also made a quit cost the *sum* of every
-    // termination, and let a single rejection abandon every session queued behind it.
-    await Promise.allSettled(
-      entries.filter((entry) => !entry.process.hasExited()).map((entry) => entry.process.terminate())
-    );
+    clearTimeout(this.completedExpiry);
+    this.completedExpiry = undefined;
+    // Shutdown owns pending spawns as well as registered processes. The launch continuation
+    // checks its reservation before publishing any process that completed startup after this.
+    this.shutdown = Promise.allSettled([
+      ...pending.map(spawned => spawned.then(child => child.hasExited() ? undefined : child.terminate())),
+      ...entries.map(entry => entry.termination ?? (entry.process.hasExited() ? undefined : entry.process.terminate()))
+    ]).then(() => { this.shutdown = undefined; });
+    for (const id of ids) this.releaseListener?.(id);
+    if (ids.size) this.notifyProcessChange();
+    return this.shutdown;
   }
 
-  private refreshProcessState(processId: number): ProcessStatus {
-    const entry = this.processes.get(processId);
-    if (!entry) return { kind: 'unknown' };
-    const exitCode = entry.process.exitCode();
-    if (entry.process.hasExited()) {
-      this.retainCompleted(entry);
-      return { kind: 'exited', exitCode };
+  private ensureProcessCapacity(): void {
+    if (this.shutdown) throw UnifiedExecError.createProcess('terminal manager is shutting down');
+    // Count the reservation before the async spawn starts. An observed exit releases capacity
+    // immediately, even if output is settling or a reader is still collecting its final bytes.
+    let active = this.reservedProcessIds.size;
+    for (const entry of this.processes.values()) {
+      if (!entry.process.hasExited()) continue;
+      active--;
+      this.retireIfIdle(entry);
     }
-    return { kind: 'alive', exitCode, processId: entry.processId };
-  }
-
-  /** Capacity is admission, never garbage collection: every retained row still owes output. */
-  private ensureProcessCapacity(requestProcessId: number): void {
-    // Reservations participate in the hard cap, so concurrent exec_command calls cannot
-    // each observe one free slot and collectively insert a 65th live process.
-    if (this.reservedProcessIds.size > MAX_UNIFIED_EXEC_PROCESSES) {
+    if (active > MAX_UNIFIED_EXEC_PROCESSES) {
       throw UnifiedExecError.createProcess(
-        `too many retained terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES}); drain a returned session with write_stdin before starting another`
+        `active terminal session limit reached (${MAX_UNIFIED_EXEC_PROCESSES} starting or running); wait for a command to finish or stop one of your own sessions, then retry`
       );
-    }
-    if (!this.reservedProcessIds.has(requestProcessId)) {
-      throw UnifiedExecError.createProcess('terminal session reservation was lost before launch');
     }
   }
 }
-
-type ProcessStatus =
-  | { kind: 'alive'; exitCode: number | null; processId: number }
-  | { kind: 'exited'; exitCode: number | null }
-  | { kind: 'unknown' };
 
 /**
  * `collect_output_until_deadline`, port for port.

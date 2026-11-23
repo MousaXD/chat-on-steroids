@@ -29,6 +29,7 @@ import { skillCatalogInstructions } from '../src/main/skills.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
 import { publishPluginSurface, pluginRefreshStatuses, resetPluginRefreshForTests } from '../src/main/plugin-refresh.js';
+import * as kernel from '../src/main/mcp/kernel.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
 import { serverInstructions } from '../src/main/mcp/instructions.js';
 import { SURFACE_LIST, surfaceDefinition, type SurfaceId } from '../src/main/mcp/surfaces.js';
@@ -4002,6 +4003,61 @@ describe('exec sessions belong to the chat that opened them', () => {
     spy.mockRestore();
   });
 
+  it('reserves no terminal id when the final workspace preflight rejects', async () => {
+    const validatedWorkspace = kernel.validatedWorkspace;
+    const validation = vi.spyOn(kernel, 'validatedWorkspace')
+      .mockImplementationOnce(validatedWorkspace)
+      .mockRejectedValueOnce(new Error('WORKSPACE_PREFLIGHT_REVOKED'));
+    const allocate = vi.spyOn(unifiedExecManager, 'allocateProcessId');
+    try {
+      const result = await asChat(null, 'exec_command', { cmd: 'echo must-not-launch', workdir: '/workspace' });
+      expect(textOf(result)).toContain('WORKSPACE_PREFLIGHT_REVOKED');
+      expect(allocate).not.toHaveBeenCalled();
+    } finally {
+      validation.mockRestore();
+      allocate.mockRestore();
+    }
+  });
+
+  it('keeps concurrent completed results isolated while one owner awaits exact attribution', async () => {
+    const callers = [
+      { request: 'wfr_terminal_parallel_a', chat: 'conv-terminal-parallel-a', output: 'parallel-a-unique' },
+      { request: 'wfr_terminal_parallel_b', chat: 'conv-terminal-parallel-b', output: 'parallel-b-unique' },
+      { request: 'wfr_terminal_parallel_late', chat: 'conv-terminal-parallel-late', output: 'parallel-late-unique' }
+    ];
+    for (const { request, chat } of callers.slice(0, 2)) expect(prove(request, chat)).toBe('stored');
+
+    const ids = await Promise.all(callers.map(async ({ request, output }) => {
+      const launched = await asChat(request, 'exec_command', {
+        cmd: IS_WINDOWS ? `Start-Sleep -Milliseconds 850; Write-Output '${output}'` : `sleep 0.85; echo '${output}'`,
+        workdir: '/workspace', yield_time_ms: 250
+      });
+      expect(failed(launched), textOf(launched)).toBe(false);
+      const id = Number(textOf(launched).match(/Process running with session ID (\d+)/)?.[1]);
+      expect(Number.isInteger(id), textOf(launched)).toBe(true);
+      return id;
+    }));
+    await vi.waitFor(() => expect(unifiedExecManager.exitedUnread(new Set(ids))).toHaveLength(3), { timeout: 5_000 });
+    expect(unifiedExecManager.listProcesses().some(process => ids.includes(process.processId))).toBe(false);
+
+    const denied = await asChat(callers[0]!.request, 'write_stdin', { session_id: ids[1], chars: '' });
+    expect(textOf(denied)).toContain('EXEC_SESSION_OWNER_MISMATCH');
+    expect(textOf(denied)).not.toContain(callers[1]!.output);
+    const unavailable = await asChat('wfr_terminal_parallel_unproven', 'write_stdin', { session_id: ids[2], chars: '' });
+    expect(textOf(unavailable)).toContain('EXEC_CALLER_UNIDENTIFIED');
+    expect(textOf(unavailable)).not.toContain(callers[2]!.output);
+
+    expect(prove(callers[2]!.request, callers[2]!.chat)).toBe('stored');
+    await Promise.all(callers.map(async ({ request, output }, index) => {
+      const result = await asChat(request, 'write_stdin', { session_id: ids[index], chars: '' });
+      expect(failed(result), textOf(result)).toBe(false);
+      expect(textOf(result)).toContain(output);
+      for (const other of callers.filter(caller => caller.output !== output)) {
+        expect(textOf(result)).not.toContain(other.output);
+      }
+    }));
+  });
+
   it('refuses write_stdin from a chat that does not own the session, and keeps serving the one that does', async () => {
     expect(prove('wfr_execown_opener', 'conv-execown-opener')).toBe('stored');
     expect(prove('wfr_execown_stranger', 'conv-execown-stranger')).toBe('stored');
@@ -4319,6 +4375,55 @@ describe('exec sessions belong to the chat that opened them', () => {
     }
   });
 
+  it('rechecks the exact terminal lifetime after asynchronous workspace validation', async () => {
+    const run = ++execOwnRuns;
+    const originalOwner = `wfr_terminal_retired_${run}`;
+    const newOwner = `wfr_terminal_recycled_${run}`;
+    expect(prove(originalOwner, `conv-terminal-retired-${run}`)).toBe('stored');
+    expect(prove(newOwner, `conv-terminal-recycled-${run}`)).toBe('stored');
+    const start = (request: string, marker: string) =>
+      asChat(request, 'exec_command', { cmd: `echo ${marker}`, workdir: '/workspace' });
+    const first = await start(originalOwner, 'first-terminal');
+    const id = Number(textOf(first).match(/Completed session ID: (\d+)/)?.[1]);
+    expect(Number.isInteger(id), textOf(first)).toBe(true);
+
+    let validationEntered!: () => void;
+    const entered = new Promise<void>(resolve => { validationEntered = resolve; });
+    let continueValidation!: () => void;
+    const wait = new Promise<void>(resolve => { continueValidation = resolve; });
+    const validateWorkspace = kernel.validatedWorkspace;
+    const validation = vi.spyOn(kernel, 'validatedWorkspace').mockImplementationOnce(async () => {
+      validationEntered();
+      await wait;
+      return validateWorkspace();
+    });
+    const allocateId = unifiedExecManager.allocateProcessId.bind(unifiedExecManager);
+    const allocation = vi.spyOn(unifiedExecManager, 'allocateProcessId');
+    const pending = asChat(originalOwner, 'write_stdin', { session_id: id, chars: '' });
+    try {
+      const beforeValidation = await Promise.race([entered.then(() => true), pending.then(() => false)]);
+      expect(beforeValidation).toBe(true);
+      unifiedExecManager.releaseProcessId(id);
+      allocation.mockImplementationOnce(() => allocateId(() => id));
+      const replacement = await start(newOwner, 'recycled-terminal');
+      expect(textOf(replacement)).toContain(`Completed session ID: ${id}`);
+      continueValidation();
+
+      const denied = await pending;
+      expect(failed(denied)).toBe(true);
+      expect(textOf(denied)).toContain('EXEC_SESSION_UNAVAILABLE');
+      expect(textOf(denied)).not.toContain('recycled-terminal');
+      const allowed = await asChat(newOwner, 'write_stdin', { session_id: id, chars: '' });
+      expect(failed(allowed), textOf(allowed)).toBe(false);
+      expect(textOf(allowed)).toContain('recycled-terminal');
+    } finally {
+      continueValidation();
+      await pending;
+      validation.mockRestore();
+      allocation.mockRestore();
+    }
+  });
+
   it('delivers completed output on an ordinary same-request call without leaking it', async () => {
     expect(prove('wfr_background_owner', 'conv-background-owner')).toBe('stored');
     expect(prove('wfr_background_other', 'conv-background-other')).toBe('stored');
@@ -4379,6 +4484,53 @@ describe('exec sessions belong to the chat that opened them', () => {
     const directRead = await asChat('wfr_background_owner', 'write_stdin', { session_id: completedId, chars: '' });
     expect(failed(directRead), textOf(directRead)).toBe(false);
     expect(textOf(directRead)).toContain('direct-result');
+  });
+
+  it('retires a launched child when the HTTP connection drops before the first exec reply', async () => {
+    const run = ++execOwnRuns;
+    const request = `wfr_terminal_dropped_${run}`;
+    const chat = `conv-terminal-dropped-${run}`;
+    expect(prove(request, chat)).toBe('stored');
+    const script = `dropped-terminal-${run}.cjs`;
+    const flag = `dropped-terminal-${run}.ready`;
+    await fs.writeFile(path.join(approved, script), `
+      const fs = require('node:fs');
+      const deadline = setTimeout(() => process.exit(1), 15000);
+      const timer = setInterval(() => {
+        if (!fs.existsSync(${JSON.stringify(flag)})) return;
+        clearTimeout(deadline);
+        clearInterval(timer);
+        console.log('finished-after-disconnect');
+      }, 20);
+    `);
+    const cmd = `node ${script}`;
+    const controller = new AbortController();
+    const dropped = fetch(endpoint.url, {
+      method: 'POST', signal: controller.signal,
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'x-request-id': request },
+      body: JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+        name: 'exec_command', arguments: { cmd, workdir: '/workspace', yield_time_ms: 30_000 }
+      } })
+    }).catch(error => error);
+    let id: number | undefined;
+    try {
+      await vi.waitFor(() => {
+        id = unifiedExecManager.listProcesses().find(entry => entry.command === cmd)?.processId;
+        expect(id).toBeDefined();
+      }, { timeout: 8000 });
+      controller.abort();
+      expect(await dropped).toMatchObject({ name: 'AbortError' });
+      await fs.writeFile(path.join(approved, flag), '');
+      await vi.waitFor(() => expect(execOwner(id!)).toBe(`session-${chat}`), { timeout: 5000 });
+      expect(unifiedExecManager.listProcesses().some(entry => entry.processId === id)).toBe(false);
+      const reread = await asChat(request, 'write_stdin', { session_id: id, chars: '' });
+      expect(failed(reread), textOf(reread)).toBe(false);
+      expect(textOf(reread)).toContain('finished-after-disconnect');
+    } finally {
+      controller.abort();
+      await fs.writeFile(path.join(approved, flag), '');
+      await dropped;
+    }
   });
 
   it('reoffers completed output after the real HTTP connection closes before publication', async () => {

@@ -55,7 +55,7 @@ it('rereads all retained output after automatic delivery and a later receipt', a
   expect(await m.offerCompletedOutput(owned, { completedAt: null, failed: false }, 1000)).toBeNull();
 });
 
-it('bounds reread output, releases oldest completed custody, and keeps unread results separate', async () => {
+it('completes 105 sequential short commands with bounded replay and oldest-result eviction', async () => {
   const m = manager();
   const released = vi.fn(); m.setProcessReleaseListener(released);
   const first = await start(m, `process.stdout.write('a'.repeat(${COMPLETED_EXEC_OUTPUT_BYTES * 2})+'TAIL')`);
@@ -63,8 +63,13 @@ it('bounds reread output, releases oldest completed custody, and keeps unread re
   const output = (await poll(m, id)).rawOutput.toString();
   expect(Buffer.byteLength(output)).toBeLessThan(COMPLETED_EXEC_OUTPUT_BYTES + 200);
   expect(output).toContain('omitted'); expect(output.endsWith('TAIL')).toBe(true);
-  // Real fast children exercise admission beyond the old active-process cap.
-  for (let i = 0; i < MAX_COMPLETED_EXEC_RESULTS; i++) await start(m, '');
+  // Include the first command in the 105 launches. None of the next 104 results is polled.
+  for (let i = 0; i < 104; i++) {
+    const completed = await start(m, `console.log(${i})`);
+    expect(completed).toMatchObject({ exitCode: 0, processId: null });
+    expect(completed.rawOutput.toString().trim()).toBe(String(i));
+  }
+  expect(released).toHaveBeenCalledTimes(105 - MAX_COMPLETED_EXEC_RESULTS);
   expect(released).toHaveBeenCalledWith(id);
   await expect(poll(m, id)).rejects.toThrow('Unknown process id');
 }, 30000);

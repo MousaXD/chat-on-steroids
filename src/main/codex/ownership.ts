@@ -26,8 +26,8 @@ export const MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION = 4;
 /**
  * How long a live session may go unpolled before the chat that opened it is reminded it exists.
  *
- * An exited session announces itself through `exitedUnread`: its result is retained until drained,
- * independently of whether its reminder has been acknowledged. A session that never exits has no such
+ * An exited session announces itself through `exitedUnread` for as long as its unread output
+ * remains in the bounded completed-result cache. A session that never exits has no such
  * trigger, and that is the second shape of a turn that reads as stuck — the model launched
  * something, moved on, and nothing in the loop ever mentioned it again. Two minutes is past any
  * yield an `exec_command` can ask for (30s) and well short of a real build.

@@ -1570,10 +1570,11 @@ structured result rather than the text, so `exec_command`'s advisory `Note:` lin
 exit codes, benign exits, recovery hints, a still-running identical command) are also carried
 in structured `supplemental_context`; delivery appends its own app context there after them.
 nonempty input to a completed process is refused and never restarts work. The same manager
-retains the latest 64 completed results for this app lifetime, with 256 KiB of raw head/tail
-output each (and delimiter-free batch presentation). Completed rereads have no unread debt,
-live-process capacity charge or automatic reoffer. Eviction/shutdown drops their existing
-custody entries; retained ids cannot be reallocated. Unread results keep their separate bounds.
+retains up to 64 completed results for up to 15 minutes in the running app. Replay history
+and the undelivered suffix each retain up to 256 KiB of raw head/tail output plus omission
+markers and, for batches, a bounded display view. Empty polling reads the undelivered suffix
+first when one exists, then rereads saved history. Expiry, oldest-result eviction and shutdown
+drop custody and output together. A retained id cannot be reused.
 Tool descriptions and result markers say what a tool does, never how its output should be treated or
 that a call is harmless: ChatGPT's safety check flagged `write_stdin`'s "including automatic delivery;
 never reruns work" as a Suspicious Instruction and held a long run on an approval card (2026-10-15), and
@@ -1638,10 +1639,13 @@ rolling tail with omission counts; UTF-8/token serialization separately bounds r
 The connector accepts legacy `max_output_tokens` but enforces its fixed response ceiling.
 Never solve a display overflow by silently discarding durable/owed data.
 
-Completed background output is still owned data. The manager does not evict exited unread
-sessions to free capacity. Four unread completed results block another spawn for that owner
-with `EXEC_RESULTS_UNREAD` before a process starts. Running servers/tails do not consume that
-completed-result limit and are not auto-killed or polled.
+The 64-slot launch limit covers commands starting or running. Admission reserves the slot after
+workspace preflight. Observed process exit releases capacity while the output settles and active
+polls finish. The manager moves completed output to the cache on settlement, or on the next
+admission if a settled entry is still present. This recovery checks exit and stream settlement
+without signalling any process, assigning custody or waiting for the original owner to poll.
+Four cached unread results still block another spawn for that owner with `EXEC_RESULTS_UNREAD`.
+Long-running servers and tails can keep their slots until they exit or are explicitly stopped.
 
 Completed results can follow automatically in later exact-owner **outer** tool responses,
 one bounded UTF-8-safe page within remaining response space. An offer does not drain bytes.

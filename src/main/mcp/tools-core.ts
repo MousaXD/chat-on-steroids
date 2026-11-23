@@ -980,12 +980,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               );
             }
 
-            const processId = unifiedExecManager.allocateProcessId();
-            // Process ids are deliberately small/reusable, while chat ownership lives in a
-            // separate registry. Clear any stale row at the allocation boundary so a recycled
-            // id cannot briefly authorize its previous chat before this call publishes the new owner.
-            forgetExecOwner(processId);
-
             const ripgrep = server ? null : locateRipgrep();
             // A server command is one ssh connection of its own; the folder and login shell are
             // set up on the server by `remoteCommand`, so the local side only needs somewhere to run.
@@ -993,7 +987,11 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               ? [sshProgram(), ...sshArgs(server, [(input.tty ?? DEFAULT_TTY) ? '-tt' : '-T'], [remoteCommand(dir.real, boundCommand)])]
               : deriveExecArgs(shell,
                 withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
+            const env = execChildEnvironment();
             await validatedWorkspace();
+            // Reserve only after asynchronous preflight. The manager owns the id from launch on.
+            const processId = unifiedExecManager.allocateProcessId();
+            forgetExecOwner(processId);
             const output = await unifiedExecManager.execCommand({
               classifyExit: (exitCode, rawOutput) => {
                 if (!batch) return nonZeroExitIsBenign(boundCommand, exitCode, rawOutput);
@@ -1012,12 +1010,14 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY,
               cwd: server ? os.tmpdir() : dir.real,
               displayCwd: dir.virtual,
-              env: execChildEnvironment(),
+              env,
               tty: input.tty ?? DEFAULT_TTY
             });
             // Which exact session or temporary request principal may later write to this
             // process id. Request custody upgrades lazily when exact correlation arrives.
-            noteExecOwner(output.processId ?? output.completedSessionId ?? null, owner);
+            if (output.identity && unifiedExecManager.processIdentity(processId) === output.identity) {
+              noteExecOwner(processId, owner);
+            }
             const responseText = execCommandResponseText(output);
             // A search that found nothing exits 1 and has not failed. Recording it as an
             // error made a session's error count meaningless; see exec-hints.ts for why this
@@ -1160,7 +1160,12 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // A worker can keep an interactive shell running after its Git worktree has been
           // replaced. Verify the exact current allocation before forwarding even empty polls:
           // stdin may execute writes in the shell's now user-owned directory.
+          const identity = unifiedExecManager.processIdentity(input.session_id);
           await validatedWorkspace();
+          if (!identity || unifiedExecManager.processIdentity(input.session_id) !== identity ||
+              execOwnershipFailure(input.session_id, execPrincipal())) {
+            return fail(`write_stdin failed for session ${input.session_id}: EXEC_SESSION_UNAVAILABLE: Session custody changed before the call could use it. No input was sent and no output was read.`);
+          }
           // Both sides of the wait. An empty poll blocks for seconds by design, and a caller
           // sitting in one is attending its session rather than neglecting it.
           noteExecAttended(input.session_id);
@@ -1172,7 +1177,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               maxOutputTokens: undefined,
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY
             });
-            noteExecAttended(input.session_id);
+            if (unifiedExecManager.processIdentity(input.session_id) === identity) noteExecAttended(input.session_id);
             noteExec({
               ...(output.processId === null ? {} : { id: String(output.processId) }),
               running: output.processId !== null,

@@ -56,7 +56,7 @@ it('does not let a lock attempt barge ahead of an already queued waiter', async 
   }
 });
 
-it('refuses new capacity without evicting a completed unread result', async () => {
+it('counts starting slots only and keeps unread output at the active limit', async () => {
   const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
   const unreadId = manager.allocateProcessId();
   const request = (processId: number, command: string, yieldTimeMs: number) => ({
@@ -84,11 +84,17 @@ it('refuses new capacity without evicting a completed unread result', async () =
       { processId: unreadId, exitCode: 7 }
     ]);
 
-    while (fillerIds.length < MAX_UNIFIED_EXEC_PROCESSES - 1) fillerIds.push(manager.allocateProcessId());
+    while (fillerIds.length < MAX_UNIFIED_EXEC_PROCESSES) fillerIds.push(manager.allocateProcessId());
     const refusedId = manager.allocateProcessId();
     await expect(manager.execCommand(request(refusedId, "console.log('must-not-run')", 100))).rejects.toThrow(
-      `too many retained terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES})`
+      `active terminal session limit reached (${MAX_UNIFIED_EXEC_PROCESSES} starting or running)`
     );
+
+    manager.releaseProcessId(fillerIds.pop()!);
+    const next = manager.allocateProcessId();
+    await expect(manager.execCommand(request(next, "console.log('capacity-recovered')", 500))).resolves.toMatchObject({
+      exitCode: 0, processId: null
+    });
 
     expect(manager.backgroundState(new Set([unreadId])).exitedUnread).toEqual([
       { processId: unreadId, exitCode: 7 }
