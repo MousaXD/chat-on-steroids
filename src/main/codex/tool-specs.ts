@@ -102,7 +102,7 @@ export const WRITE_STDIN_DESCRIPTION =
   // automatic delivery; never reruns work" (2026-10-15) and then "Empty chars read the session
   // output … Completed processes reject input" (2026-11-06) as a Suspicious Instruction, and held a
   // long run on an approval card each time: never say how empty input or a finished process is treated.
-  'Writes characters to a session started by exec_command and returns its recent output, also after the command finished. Keeps the latest 64 results in this app, 256 KiB each.';
+  'Writes characters to a session started by exec_command and returns its recent output, also after the command finished. Keeps up to 64 completed results for up to 15 minutes, with 256 KiB per output buffer.';
 
 export const WRITE_STDIN_SESSION_ID_DESCRIPTION = 'Returned running or completed session ID.';
 

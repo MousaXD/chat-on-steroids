@@ -118,6 +118,8 @@ it.each(['exec_command', 'write_stdin'] as const)('delivers terminal corrections
     originalTokenCount: 0, outputOmittedBytes: null };
   const handler = name === 'exec_command' ? vi.spyOn(unifiedExecManager, 'execCommand') : vi.spyOn(unifiedExecManager, 'writeStdin');
   handler.mockResolvedValue(output);
+  // The write path validates both the owner and the same process incarnation across preflight.
+  const identify = name === 'write_stdin' ? vi.spyOn(unifiedExecManager, 'processIdentity').mockReturnValue({}) : undefined;
   const args = name === 'exec_command' ? { cmd: 'echo fixture', workdir: '/workspace' } : { session_id: processId };
   const send = () => rpc('tools/call', { name, arguments: args }, who.requestId);
   try {
@@ -147,6 +149,7 @@ it.each(['exec_command', 'write_stdin'] as const)('delivers terminal corrections
     expect(handler).toHaveBeenCalledTimes(3);
   } finally {
     await send(); // Settle any offered correction even when a regression assertion fails.
+    identify?.mockRestore();
     for (const entry of await listInputs()) if (entry.sessionId === who.session.id) await cancelInput(entry.id);
     forgetExecOwner(processId);
   }
