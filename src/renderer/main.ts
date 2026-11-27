@@ -1453,7 +1453,7 @@ function updateSummary({ bridge, update, config, status }: AppState): { text: st
   // A mismatched companion can fail the protocol gate before it becomes present.
   // Retain its last observed version until a matching companion actually reports in.
   const missing = !stale && bridge.running && !bridge.present && isRunning(status.state) && browserExtensionRequired(config);
-  if (!stale && !missing && !update.latest && update.stage === 'idle' && !update.checkedAt && !update.notInstalled) return null;
+  if (!update.disabled && !stale && !missing && !update.latest && update.stage === 'idle' && !update.checkedAt && !update.notInstalled) return null;
 
   const lines: string[] = [];
   let tone: UpdateTone = 'work';
@@ -1483,6 +1483,8 @@ function updateSummary({ bridge, update, config, status }: AppState): { text: st
     tone = 'bad';
   } else if (update.stage === 'checking') {
     lines.push(t("Checking for a newer version…"));
+  } else if (update.disabled) {
+    lines.push('Application updates disabled (manual installation only).');
   } else if (!stale && !missing && !update.notInstalled) {
     const extension = bridge.present && bridge.extensionVersion ? t(" · extension {0}", [bridge.extensionVersion]) : '';
     lines.push(t("Up to date! Chat On Steroids {0}{1}", [update.current, extension]));

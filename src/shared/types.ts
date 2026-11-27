@@ -833,6 +833,8 @@ export interface CompanionTabDiagnostics {
  * this run, and only a timestamp lets the UI say "up to date" rather than "nothing to report".
  */
 export interface UpdateStatus {
+  /** Application updater deliberately unavailable in this build. */
+  disabled?: boolean;
   current: string;
   latest: string | null;
   stage: 'idle' | 'checking' | 'downloading' | 'ready' | 'failed';

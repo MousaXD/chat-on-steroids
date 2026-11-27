@@ -16,6 +16,8 @@ function value(name, fallback) {
 const platform = normalizePlatform(value('platform', process.platform));
 const arches = value('arch', process.arch).split(',').map((item) => normalizeArch(item.trim()));
 const dirOnly = args.includes('--dir');
+const debOnly = args.includes('--deb-only');
+if (debOnly && (platform !== 'linux' || dirOnly)) throw new Error('--deb-only requires Linux installer packaging');
 
 function run(command, commandArgs, env = process.env) {
   const result = spawnSync(command, commandArgs, { cwd: root, stdio: 'inherit', env });
@@ -46,6 +48,7 @@ for (const arch of arches) {
   const builderArgs = [
     path.join('node_modules', 'electron-builder', 'out', 'cli', 'cli.js'),
     PLATFORM_INFO[platform].builderFlag,
+    ...(debOnly ? ['deb'] : []),
     `--${arch}`,
     '--publish',
     'never'

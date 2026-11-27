@@ -17,7 +17,7 @@ interface ReadinessRow {
 export function updateReadiness(next: AppState): ReadinessRow[] {
   const { update, bridge, status } = next;
   const appReady = update.stage === 'idle' && !update.latest && update.checkedAt != null;
-  const appDetail = update.stage === 'failed' ? t('Update check failed')
+  const appDetail = update.disabled ? 'Application updates disabled (manual installation only)' : update.stage === 'failed' ? t('Update check failed')
     : update.stage === 'checking' ? t('Checking for a newer version…')
     : update.stage === 'downloading' ? t('Downloading {0}', [update.latest])
     : update.latest ? (update.stage === 'ready' ? t('Ready to install {0}', [update.latest]) : t('Install {0} manually', [update.latest]))
@@ -27,7 +27,7 @@ export function updateReadiness(next: AppState): ReadinessRow[] {
   const appOlder = !!bridge.extensionVersion && isNewer(bridge.extensionVersion, update.current);
   const connectionFailed = ['offline', 'auth-failed', 'tunnel-unavailable'].includes(status.state);
   const rows: ReadinessRow[] = [
-    { id: 'app', label: 'Chat On Steroids', status: appReady ? 'pass' : update.stage === 'failed' ? 'fail' : 'not-run',
+    { id: 'app', label: 'Chat On Steroids', status: update.disabled ? 'skipped' : appReady ? 'pass' : update.stage === 'failed' ? 'fail' : 'not-run',
       detail: t('Version {0}', [update.current]) + ' · ' + appDetail,
       reason: update.stage === 'failed' && update.error ? updateErrorText(update.error) : undefined,
       nextStep: update.stage === 'failed' ? updateErrorNeedsDiagnostics(update.error)
@@ -41,7 +41,7 @@ export function updateReadiness(next: AppState): ReadinessRow[] {
       reason: !bridge.running ? bridge.error ?? undefined : undefined,
       nextStep: extensionReady ? undefined : extensionOlder
         ? t("Let active chats finish, then reload the browser extension in your browser.")
-        : appOlder ? t('Choose Update all to check for updates and update the app.')
+        : appOlder ? (update.disabled ? 'Install a compatible app build manually.' : t('Choose Update all to check for updates and update the app.'))
         : t("Open ChatGPT with the browser extension enabled, then choose Review setup.") }
   ];
   const surfaces = status.surfaces ?? [];
